@@ -19,14 +19,17 @@ English | [中文说明](./README.md)
 | OpenRouter (`openrouter`) | Balance |
 | OpenCode Go (`opencode-go`) | 5h / 7d / mo usage |
 | OpenAI Codex (`openai-codex`, ChatGPT Plus/Pro OAuth login) | 5h / weekly usage, plan badge |
+| Codex Account Pool (`codex-account-pool`) | Active pool account, 5h / weekly usage, plan badge |
 
-Other providers are not queried, widget shows `--`. `opencode-go` uses pi's existing `OPENCODE_API_KEY`. `openai-codex` reuses pi's `/login openai-codex` OAuth credential (access token, auto-refreshed by pi); a plain OpenAI API key cannot query ChatGPT subscription limits. `kimi-coding` supports both pi's `/login kimi-coding` OAuth subscription and a plain `KIMI_API_KEY`. The `/login` commands are built into pi; this extension only reads the resolved credential and never implements or stores the login flow.
+Other providers are not queried, widget shows `--`. `opencode-go` uses pi's existing `OPENCODE_API_KEY`. `openai-codex` reuses pi's `/login openai-codex` OAuth credential (access token, auto-refreshed by pi); a plain OpenAI API key cannot query ChatGPT subscription limits. `codex-account-pool` resolves quota through Pi's shared event bus and displays the account actually bound to the current session; no OAuth token crosses the bus. `kimi-coding` supports both pi's `/login kimi-coding` OAuth subscription and a plain `KIMI_API_KEY`.
 
 ## Installation
 
 ```bash
-pi install npm:pi-check-agent-quota
+pi install https://github.com/rodrigojager/pi-check-agent-quota
 ```
+
+This fork adds account-aware integration with `rodrigojager/pi-codex-account-pool`; all original provider fetchers remain available.
 
 API keys reuse pi's existing provider authentication, no extra configuration required.
 

@@ -19,14 +19,17 @@
 | OpenRouter (`openrouter`) | 余额 |
 | OpenCode Go (`opencode-go`) | 5h / 7d / mo 使用率 |
 | OpenAI Codex (`openai-codex`，ChatGPT Plus/Pro OAuth 登录) | 5h / 周使用率、套餐标识 |
+| Codex Account Pool (`codex-account-pool`) | 当前池账户、5h / 周使用率、套餐标识 |
 
 其他 provider 不查询，Widget 显示 `--`。`opencode-go` 使用 pi 已有的 `OPENCODE_API_KEY`。`openai-codex` 复用 pi `/login openai-codex` 的 OAuth 凭据（access token，由 pi 自动续期）；普通 OpenAI API key 无法查询 ChatGPT 订阅限额。`kimi-coding` 同时支持 pi `/login kimi-coding` 的 OAuth 订阅和普通 `KIMI_API_KEY`。`/login` 是 pi 内置命令，不是本扩展注册的命令；本扩展只读取 pi 已解析的凭据，不实现或保存登录流程。
 
 ## 安装
 
 ```bash
-pi install npm:pi-check-agent-quota
+pi install https://github.com/rodrigojager/pi-check-agent-quota
 ```
+
+此分支通过 Pi 共享事件总线支持 `rodrigojager/pi-codex-account-pool`，并保留所有原有 provider。
 
 API key 复用 pi 已有的 provider 认证，无需额外配置。
 

@@ -3,7 +3,7 @@ import { chmodSync, readFileSync } from "node:fs";
 import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { fetchProviderQuota, isUnProvider, normalizeProvider, fetchWithRetry } from "./lib/providers.js";
+import { fetchProviderQuota, isExternalQuotaProvider, isUnProvider, normalizeProvider, fetchWithRetry } from "./lib/providers.js";
 import type { Auth, FetchPayload } from "./lib/providers.js";
 import { LOCALES, QUOTA_COLORS, hexFg, formatRemaining, formatDays, clampPct, annotateItems, missingItems, emptyItems, normalizeLanguage, QuotaComponent, formatAge, getQuotaSettings, setQuotaSettings, resetQuotaSettings, AUTO_REFRESH_MAX_MINUTES, type Component, type QuotaSettings, type RenderItem, type Language, setCurrentLanguage } from "./lib/widget.js";
 import { estimateEta, medianGapMs, ETA_MAX_ROUNDS, RATE_METRIC_PRIORITY, type EtaSample, type EtaEstimate } from "./lib/eta.js";
@@ -14,6 +14,9 @@ const AQ10_CMD_NAME = "aq10";
 const AQLANG_CMD_NAME = "aqlang";
 const AQSET_CMD_NAME = "aqset";
 const AQAUTO_CMD_NAME = "aqauto";
+const QUOTA_REQUEST_EVENT = "pi-quota:request";
+const QUOTA_RESPONSE_EVENT = "pi-quota:response";
+const ACCOUNT_CHANGED_EVENT = "codex-account-pool:account-changed";
 
 const AGENT_START_REFRESH_AFTER_MS = 60 * 60_000;
 const AGENT_START_FETCH_TIMEOUT_MS = 3_000;
@@ -28,6 +31,8 @@ const DISK_CACHE_DIR_MODE = 0o700;
 type QuotaSnapshot = FetchPayload & {
   provider: string;
   fetchedAt: number;
+  identityKey?: string;
+  accountLabel?: string;
 };
 
 type ConsumptionRecord = {
@@ -77,7 +82,7 @@ type RefreshTrigger =
 
 let cachedItems: RenderItem[] = emptyItems();
 
-let currentLanguage: Language = "zh";
+let currentLanguage: Language = "en";
 
 setCurrentLanguage(currentLanguage);
 let currentProvider: string | null = null;
@@ -92,6 +97,16 @@ type RuntimeProviderState = {
 };
 
 const providerState = new Map<string, RuntimeProviderState>();
+const providerIdentityKeys = new Map<string, string>();
+let currentSessionId: string | null = null;
+
+function stateKey(provider: string): string {
+  const identity = providerIdentityKeys.get(provider);
+  return identity ? `${provider}:${identity}` : provider;
+}
+function stateFor(provider: string): RuntimeProviderState | undefined {
+  return providerState.get(stateKey(provider));
+}
 
 let baseRound: { provider: string; snapshot: QuotaSnapshot } | null = null;
 
@@ -132,7 +147,7 @@ function readDiskCacheSync(): DiskCache | null {
 }
 
 function latestLineSnapshot(provider: string): QuotaSnapshot | null {
-  const state = providerState.get(provider);
+  const state = stateFor(provider);
   const trigger = state?.trigger_line;
   const settled = state?.settled_line;
   if (!trigger) return settled ?? null;
@@ -151,24 +166,25 @@ let diskWriteScheduled = false;
 
 function writeDiskCacheAsync(): void {
   if (isShuttingDown) return;
-  const providerIds = new Set<string>(providerState.keys());
-  if (baseRound) providerIds.add(baseRound.provider);
+  const providerKeys = new Set<string>(providerState.keys());
+  if (baseRound) providerKeys.add(stateKey(baseRound.provider));
 
   const providers: Record<string, ProviderCache> = {};
-  for (const provider of providerIds) {
-    if (isUnProvider(provider)) continue;
+  for (const key of providerKeys) {
     const entry: ProviderCache = {};
-    const state = providerState.get(provider);
+    const state = providerState.get(key);
+    const sample = state?.trigger_line ?? state?.settled_line;
+    if (sample && isUnProvider(sample.provider)) continue;
     if (state?.trigger_line) entry.trigger_line = state.trigger_line;
     if (state?.settled_line) entry.settled_line = state.settled_line;
-    if (baseRound?.provider === provider) {
+    if (baseRound && stateKey(baseRound.provider) === key) {
       entry.base_line = baseRound.snapshot;
     }
     if (state?.consumptions) entry.consumptions = state.consumptions;
-    if (Object.keys(entry).length > 0) providers[provider] = entry;
+    if (Object.keys(entry).length > 0) providers[key] = entry;
   }
   const active_round: ActiveRound | undefined = baseRound
-    ? { provider: baseRound.provider, provider_changed: roundProviderChanged }
+    ? { provider: stateKey(baseRound.provider), provider_changed: roundProviderChanged }
     : undefined;
   pendingDiskWrite = JSON.stringify({
     version: 2,
@@ -200,23 +216,24 @@ async function writeDiskFile(data: string): Promise<void> {
 }
 
 function updateSuccessfulLine(provider: string, snapshot: QuotaSnapshot, trigger: RefreshTrigger): void {
-  const state = providerState.get(provider) ?? {};
+  const key = stateKey(provider);
+  const state = providerState.get(key) ?? {};
   if (trigger === "agent_settled") {
     state.settled_line = snapshot;
   } else {
     state.trigger_line = snapshot;
   }
-  providerState.set(provider, state);
+  providerState.set(key, state);
 }
 
 function loadFromDisk(): DiskCache | null {
   const disk = readDiskCacheSync();
   if (!disk || Array.isArray(disk.providers)) {
-    currentLanguage = "zh";
+    currentLanguage = "en";
     setCurrentLanguage(currentLanguage);
     return null;
   }
-  currentLanguage = normalizeLanguage(disk.language) ?? "zh";
+  currentLanguage = normalizeLanguage(disk.language) ?? "en";
   setCurrentLanguage(currentLanguage);
 
   if (disk.settings && typeof disk.settings === "object" && !Array.isArray(disk.settings)) {
@@ -225,27 +242,25 @@ function loadFromDisk(): DiskCache | null {
 
   providerState.clear();
 
-  for (const [provider, rawEntry] of Object.entries(disk.providers)) {
-
-    if (isUnProvider(provider)) continue;
+  for (const [key, rawEntry] of Object.entries(disk.providers)) {
     if (!rawEntry || typeof rawEntry !== "object" || Array.isArray(rawEntry)) continue;
     const entry = rawEntry as ProviderCache;
 
     const state: RuntimeProviderState = {};
     if (entry.trigger_line) {
-      const trigger = { ...entry.trigger_line, provider };
-      if (isValidSnapshot(trigger)) state.trigger_line = trigger;
+      const trigger = { ...entry.trigger_line };
+      if (isValidSnapshot(trigger) && !isUnProvider(trigger.provider)) state.trigger_line = trigger;
     }
     if (entry.settled_line) {
-      const settled = { ...entry.settled_line, provider };
-      if (isValidSnapshot(settled)) state.settled_line = settled;
+      const settled = { ...entry.settled_line };
+      if (isValidSnapshot(settled) && !isUnProvider(settled.provider)) state.settled_line = settled;
     }
     if (Array.isArray(entry.consumptions)) {
       const records = entry.consumptions.filter(isValidConsumptionRecord).slice(-CONSUMPTION_CAPACITY);
       if (records.length > 0) state.consumptions = records;
     }
     if (state.trigger_line || state.settled_line || state.consumptions) {
-      providerState.set(provider, state);
+      providerState.set(key, state);
     }
   }
   return disk;
@@ -268,6 +283,9 @@ function renderSnapshotWithDiff(
   isIdle: boolean,
 ): RenderItem[] {
   let items: RenderItem[] = snapshot.items.map((it) => ({ ...it }));
+  if (snapshot.accountLabel) {
+    items = [{ kind: "text", text: `Codex Pool · ${snapshot.accountLabel} | ` }, ...items];
+  }
   if (diff && diff.kind !== "changed" && diff.kind !== "reset") {
     const annotationFor = (item: Extract<RenderItem, { kind: "pct" | "balance" }>): string | undefined => {
       const metric = item.metric;
@@ -475,6 +493,54 @@ async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | unde
   }
 }
 
+type ExternalQuotaResponse = {
+  requestId?: unknown;
+  provider?: unknown;
+  identityKey?: unknown;
+  accountLabel?: unknown;
+  payload?: unknown;
+  error?: unknown;
+};
+
+async function fetchExternalQuota(provider: string, force: boolean, signal: AbortSignal) {
+  if (!registeredPi || !currentSessionId) throw new Error("Quota bridge is not ready");
+  const requestId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return new Promise<{ payload: FetchPayload; identityKey: string; accountLabel?: string }>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      off();
+      signal.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = () => finish(() => reject(new Error("Quota request aborted")));
+    const off = registeredPi!.events.on(QUOTA_RESPONSE_EVENT, (raw) => {
+      const response = raw as ExternalQuotaResponse;
+      if (response?.requestId !== requestId || response.provider !== provider) return;
+      finish(() => {
+        if (typeof response.error === "string") return reject(new Error(response.error));
+        if (typeof response.identityKey !== "string") return reject(new Error("Quota response has no account identity"));
+        validatePayload(response.payload);
+        resolve({
+          payload: response.payload as FetchPayload,
+          identityKey: response.identityKey,
+          accountLabel: typeof response.accountLabel === "string" ? response.accountLabel : undefined,
+        });
+      });
+    });
+    const timer = setTimeout(() => finish(() => reject(new Error("Quota bridge timed out"))), 12_000);
+    signal.addEventListener("abort", onAbort, { once: true });
+    registeredPi!.events.emit(QUOTA_REQUEST_EVENT, {
+      requestId,
+      provider,
+      sessionId: currentSessionId,
+      force,
+    });
+  });
+}
+
 async function refreshQuota(ctx: ExtensionContext, trigger: RefreshTrigger): Promise<RefreshResult> {
   if (isShuttingDown) return { ok: false };
   const providerId = normalizeProvider(ctx.model?.provider);
@@ -491,7 +557,7 @@ async function refreshQuota(ctx: ExtensionContext, trigger: RefreshTrigger): Pro
     currentStatus = "un-provider";
 
     markUnProviderChanged(providerId);
-    providerState.delete(providerId);
+    providerState.delete(stateKey(providerId));
     showMissing(ctx);
     return { ok: false };
   }
@@ -501,33 +567,33 @@ async function refreshQuota(ctx: ExtensionContext, trigger: RefreshTrigger): Pro
     return await existingBeforeAuth.done;
   }
 
-  let resolved: Awaited<ReturnType<ExtensionContext["modelRegistry"]["getProviderAuth"]>>;
-  try {
-    resolved = await ctx.modelRegistry.getProviderAuth(providerId);
-  } catch {
-
-    if (currentProvider === providerId) {
-      currentStatus = "failed";
-      refreshWidget(ctx);
+  let fetchAuth: Auth | undefined;
+  if (!isExternalQuotaProvider(providerId)) {
+    let resolved: Awaited<ReturnType<ExtensionContext["modelRegistry"]["getProviderAuth"]>>;
+    try {
+      resolved = await ctx.modelRegistry.getProviderAuth(providerId);
+    } catch {
+      if (currentProvider === providerId) {
+        currentStatus = "failed";
+        refreshWidget(ctx);
+      }
+      return { ok: false };
     }
-    return { ok: false };
+    const resolvedAuth = resolved?.auth;
+    const auth = resolvedAuth?.apiKey ? resolvedAuth : { ...resolvedAuth, apiKey: bearerFromAuthHeaders(resolvedAuth?.headers) };
+    const apiKey = auth?.apiKey;
+    if (!apiKey) {
+      currentProvider = providerId;
+      currentStatus = "ok";
+      showMissing(ctx);
+      return { ok: false };
+    }
+    fetchAuth = { apiKey, baseUrl: auth.baseUrl };
   }
-  const resolvedAuth = resolved?.auth;
-
-  const auth = resolvedAuth?.apiKey ? resolvedAuth : { ...resolvedAuth, apiKey: bearerFromAuthHeaders(resolvedAuth?.headers) };
 
   if (isShuttingDown || currentProvider !== providerId) return { ok: false };
   currentStatus = "fetching";
   refreshWidget(ctx);
-
-  const apiKey = auth?.apiKey;
-  if (!apiKey) {
-    currentProvider = providerId;
-    currentStatus = "ok";
-    showMissing(ctx);
-    return { ok: false };
-  }
-  const fetchAuth: Auth = { apiKey, baseUrl: auth.baseUrl };
 
   const existingAfterAuth = inflightRequest;
   if (existingAfterAuth?.provider === providerId) {
@@ -555,9 +621,20 @@ async function refreshQuota(ctx: ExtensionContext, trigger: RefreshTrigger): Pro
 
   let result: RefreshResult = { ok: false };
   try {
-    const payload = await fetchWithRetry(controller.signal, () =>
-      fetchProviderQuota(providerId, fetchAuth, controller.signal),
-    );
+    let payload: FetchPayload | null;
+    let identityKey: string | undefined;
+    let accountLabel: string | undefined;
+    if (isExternalQuotaProvider(providerId)) {
+      const external = await fetchExternalQuota(providerId, trigger === "checkaq", controller.signal);
+      payload = external.payload;
+      identityKey = external.identityKey;
+      accountLabel = external.accountLabel;
+      providerIdentityKeys.set(providerId, identityKey);
+    } else {
+      payload = await fetchWithRetry(controller.signal, () =>
+        fetchProviderQuota(providerId, fetchAuth!, controller.signal),
+      );
+    }
     if (payload === null) {
       currentStatus = "un-provider";
       result = { ok: false };
@@ -569,6 +646,8 @@ async function refreshQuota(ctx: ExtensionContext, trigger: RefreshTrigger): Pro
       const snapshot: QuotaSnapshot = {
         provider: providerId,
         fetchedAt: Date.now(),
+        identityKey,
+        accountLabel,
         ...payload,
       };
       updateSuccessfulLine(providerId, snapshot, trigger);
@@ -669,9 +748,10 @@ async function handleAgentSettled(ctx: ExtensionContext): Promise<void> {
     return;
   }
   const snap = refreshResult.snapshot;
-  const state = providerState.get(providerId) ?? {};
+  const key = stateKey(providerId);
+  const state = providerState.get(key) ?? {};
   state.settled_line = snap;
-  providerState.set(providerId, state);
+  providerState.set(key, state);
 
   if (roundProviderChanged) {
 
@@ -705,9 +785,10 @@ async function handleAgentSettled(ctx: ExtensionContext): Promise<void> {
         deltas: consumption,
         currency: diff.kind === "balance" ? diff.currency : undefined,
       };
-      const state = providerState.get(providerId) ?? {};
+      const key = stateKey(providerId);
+      const state = providerState.get(key) ?? {};
       state.consumptions = appendConsumption(state.consumptions, record);
-      providerState.set(providerId, state);
+      providerState.set(key, state);
     }
   }
   finishSettledRound(ctx);
@@ -716,7 +797,7 @@ async function handleAgentSettled(ctx: ExtensionContext): Promise<void> {
 type SessionStartReason = "startup" | "reload" | "new" | "resume" | "fork";
 
 function restoreBaseLine(providerId: string, disk: DiskCache | null): void {
-  const diskBase = disk?.providers?.[providerId]?.base_line;
+  const diskBase = disk?.providers?.[stateKey(providerId)]?.base_line;
   if (!diskBase || typeof diskBase !== "object" || Array.isArray(diskBase)) return;
   const base = { ...diskBase, provider: providerId };
   if (isValidSnapshot(base)) {
@@ -724,7 +805,7 @@ function restoreBaseLine(providerId: string, disk: DiskCache | null): void {
   }
 
   const ar = disk?.active_round;
-  if (ar && typeof ar === "object" && !Array.isArray(ar) && ar.provider === providerId) {
+  if (ar && typeof ar === "object" && !Array.isArray(ar) && ar.provider === stateKey(providerId)) {
     roundProviderChanged = ar.provider_changed === true;
   }
 }
@@ -785,7 +866,7 @@ async function runCheckaq(ctx: ExtensionContext): Promise<void> {
     currentStatus = "un-provider";
 
     markUnProviderChanged(providerId);
-    providerState.delete(providerId);
+    providerState.delete(stateKey(providerId));
     showMissing(ctx);
     return;
   }
@@ -952,7 +1033,7 @@ async function runAq10(ctx: ExtensionContext): Promise<void> {
     ctx.ui.notify(`${providerId}: ${locale.quotaUnavailable}`, "info");
     return;
   }
-  const records = providerState.get(providerId)?.consumptions ?? [];
+  const records = stateFor(providerId)?.consumptions ?? [];
   if (records.length === 0) {
     ctx.ui.notify(`${providerId}: ${locale.noConsumptionRecords}`, "info");
     return;
@@ -1001,6 +1082,21 @@ function registerLocalizedCommands(pi: ExtensionAPI): void {
 }
 
 export default function (pi: ExtensionAPI) {
+  registeredPi = pi;
+  const stopAccountChanged = pi.events.on(ACCOUNT_CHANGED_EVENT, (raw) => {
+    const event = raw as { provider?: unknown; sessionId?: unknown; accountId?: unknown };
+    if (event.provider !== "codex-account-pool" || event.sessionId !== currentSessionId || typeof event.accountId !== "string") return;
+    providerIdentityKeys.set("codex-account-pool", event.accountId);
+    if (currentProvider !== "codex-account-pool" || !lastCtx) return;
+    inflightRequest?.controller.abort();
+    baseRound = null;
+    roundProviderChanged = true;
+    lastDiff = { kind: "changed" };
+    currentStatus = "fetching";
+    refreshWidget(lastCtx);
+    void refreshQuota(lastCtx, "model_select");
+  });
+
   pi.on("session_shutdown", async () => {
 
     isShuttingDown = true;
@@ -1008,10 +1104,13 @@ export default function (pi: ExtensionAPI) {
     const request = inflightRequest;
     inflightRequest = null;
     request?.controller.abort();
+    stopAccountChanged();
+    currentSessionId = null;
 
     await diskWriteQueue;
   });
   pi.on("session_start", (event, ctx) => {
+    currentSessionId = ctx.sessionManager.getSessionId();
     handleSessionStart(ctx, event.reason);
     ensureAgeTicker();
   });
@@ -1024,7 +1123,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_settled", async (_event, ctx) => {
     await handleAgentSettled(ctx);
   });
-  registeredPi = pi;
   registerLocalizedCommands(pi);
 }
 
@@ -1164,7 +1262,7 @@ function appendConsumption(records: ConsumptionRecord[] | undefined, record: Con
 
 function currentEta(provider: string): EtaEstimate | null {
   const snap = latestLineSnapshot(provider);
-  const records = providerState.get(provider)?.consumptions;
+  const records = stateFor(provider)?.consumptions;
   if (!snap || !records) return null;
 
   const metrics = Object.keys(snap.metrics);

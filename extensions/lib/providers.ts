@@ -175,6 +175,8 @@ export async function fetchWithRetry<T>(signal: AbortSignal, fn: () => Promise<T
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
+export const EXTERNAL_QUOTA_PROVIDERS: ReadonlySet<string> = new Set(["codex-account-pool"]);
+
 export const PROVIDER_FETCHERS: Record<string, Fetcher> = {
   minimax: fetchMinimaxGlobal,
   "minimax-cn": fetchMinimaxCn,
@@ -206,7 +208,11 @@ export function normalizeProvider(provider: string | undefined): string | null {
 }
 
 export function isUnProvider(provider: string): boolean {
-  return UN_PROVIDERS.has(provider) || !Object.hasOwn(PROVIDER_FETCHERS, provider);
+  return UN_PROVIDERS.has(provider) || (!EXTERNAL_QUOTA_PROVIDERS.has(provider) && !Object.hasOwn(PROVIDER_FETCHERS, provider));
+}
+
+export function isExternalQuotaProvider(provider: string): boolean {
+  return EXTERNAL_QUOTA_PROVIDERS.has(provider);
 }
 
 export async function fetchProviderQuota(
