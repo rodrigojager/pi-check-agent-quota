@@ -16,13 +16,17 @@ const AQSET_CMD_NAME = "aqset";
 const AQAUTO_CMD_NAME = "aqauto";
 const QUOTA_REQUEST_EVENT = "pi-quota:request";
 const QUOTA_RESPONSE_EVENT = "pi-quota:response";
+const QUOTA_UPDATED_EVENT = "pi-quota:updated";
+const POOL_PROVIDER = "codex-account-pool";
+const POOL_ACTIVE_REFRESH_MS = 15_000;
+const POOL_IDLE_REFRESH_MS = 60_000;
 const ACCOUNT_CHANGED_EVENT = "codex-account-pool:account-changed";
 
 const AGENT_START_REFRESH_AFTER_MS = 60 * 60_000;
 const AGENT_START_FETCH_TIMEOUT_MS = 3_000;
 const CHECKAQ_THROTTLE_MS = 1_000;
 const CONSUMPTION_CAPACITY = 10;
-const DISK_CACHE_DIR = join(homedir(), ".pi", "agent", "pi-check-agent-quota");
+const DISK_CACHE_DIR = join(process.env.PI_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "pi-check-agent-quota");
 const DISK_CACHE_FILE = join(DISK_CACHE_DIR, "quota-cache.json");
 const DISK_CACHE_TEMP_FILE = `${DISK_CACHE_FILE}.tmp`;
 const DISK_CACHE_MODE = 0o600;
@@ -78,7 +82,9 @@ type RefreshTrigger =
   | "agent_start_stale"
   | "agent_settled"
   | "checkaq"
-  | "auto_refresh";
+  | "auto_refresh"
+  | "turn_end"
+  | "pool_update";
 
 let cachedItems: RenderItem[] = emptyItems();
 
@@ -267,7 +273,8 @@ function loadFromDisk(): DiskCache | null {
 }
 
 function isSnapshotFresh(snapshot: QuotaSnapshot | null): boolean {
-  return !!snapshot && Date.now() - snapshot.fetchedAt <= AGENT_START_REFRESH_AFTER_MS;
+  const maxAge = snapshot?.provider === POOL_PROVIDER ? POOL_ACTIVE_REFRESH_MS : AGENT_START_REFRESH_AFTER_MS;
+  return !!snapshot && Date.now() - snapshot.fetchedAt < maxAge;
 }
 
 function statusAnnotation(leadingSpace: boolean): RenderItem | null {
@@ -337,6 +344,8 @@ function renderSnapshotWithDiff(
 
   if (!isIdle) {
     items.push({ kind: "annotation", text: ` (${LOCALES[currentLanguage].using})` });
+    // Never disguise a failed refresh as a healthy, current reading while busy.
+    if (currentStatus === "failed") items.push(statusAnnotation(true)!);
   } else {
 
     if (diff?.kind === "changed") {
@@ -352,7 +361,7 @@ function renderSnapshotWithDiff(
 
 let activeWidget: QuotaComponent | null = null;
 
-const AGE_TICK_MS = 60_000;
+const AGE_TICK_MS = 5_000;
 let lastCtx: ExtensionContext | null = null;
 let ageTickTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -372,16 +381,20 @@ function ensureAgeTicker(): void {
   if (ageTickTimer) return;
   ageTickTimer = setInterval(() => {
 
-    if (!activeWidget || isShuttingDown || !lastCtx) return;
+    if (isShuttingDown || !lastCtx) return;
     if (!currentProvider || isUnProvider(currentProvider)) return;
 
-    const interval = autoRefreshMs();
+    // Pool usage changes throughout multi-tool runs, not just at agent_settled.
+    // Do not depend on the widget being mounted (fullscreen/sidebar/RPC).
+    const interval = currentProvider === POOL_PROVIDER
+      ? (lastCtx.isIdle() ? POOL_IDLE_REFRESH_MS : POOL_ACTIVE_REFRESH_MS)
+      : autoRefreshMs();
     if (interval > 0 && Date.now() - lastAutoAttemptAt >= interval) {
       lastAutoAttemptAt = Date.now();
       void refreshQuota(lastCtx, "auto_refresh");
     }
 
-    if (currentStatus !== "failed") refreshWidget(lastCtx);
+    refreshWidget(lastCtx);
   }, AGE_TICK_MS);
 
   ageTickTimer.unref?.();
@@ -498,6 +511,7 @@ type ExternalQuotaResponse = {
   provider?: unknown;
   identityKey?: unknown;
   accountLabel?: unknown;
+  fetchedAt?: unknown;
   payload?: unknown;
   error?: unknown;
 };
@@ -505,7 +519,8 @@ type ExternalQuotaResponse = {
 async function fetchExternalQuota(provider: string, force: boolean, signal: AbortSignal) {
   if (!registeredPi || !currentSessionId) throw new Error("Quota bridge is not ready");
   const requestId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  return new Promise<{ payload: FetchPayload; identityKey: string; accountLabel?: string }>((resolve, reject) => {
+  signal.throwIfAborted();
+  return new Promise<{ payload: FetchPayload; identityKey: string; accountLabel?: string; fetchedAt?: number }>((resolve, reject) => {
     let settled = false;
     const finish = (callback: () => void) => {
       if (settled) return;
@@ -522,12 +537,17 @@ async function fetchExternalQuota(provider: string, force: boolean, signal: Abor
       finish(() => {
         if (typeof response.error === "string") return reject(new Error(response.error));
         if (typeof response.identityKey !== "string") return reject(new Error("Quota response has no account identity"));
-        validatePayload(response.payload);
-        resolve({
-          payload: response.payload as FetchPayload,
-          identityKey: response.identityKey,
-          accountLabel: typeof response.accountLabel === "string" ? response.accountLabel : undefined,
-        });
+        try {
+          validatePayload(response.payload);
+          resolve({
+            payload: response.payload as FetchPayload,
+            identityKey: response.identityKey,
+            accountLabel: typeof response.accountLabel === "string" ? response.accountLabel : undefined,
+            fetchedAt: typeof response.fetchedAt === "number" && Number.isFinite(response.fetchedAt) ? response.fetchedAt : undefined,
+          });
+        } catch (error) {
+          reject(error);
+        }
       });
     });
     const timer = setTimeout(() => finish(() => reject(new Error("Quota bridge timed out"))), 12_000);
@@ -624,17 +644,20 @@ async function refreshQuota(ctx: ExtensionContext, trigger: RefreshTrigger): Pro
     let payload: FetchPayload | null;
     let identityKey: string | undefined;
     let accountLabel: string | undefined;
+    let fetchedAt = Date.now();
     if (isExternalQuotaProvider(providerId)) {
-      const external = await fetchExternalQuota(providerId, trigger === "checkaq", controller.signal);
+      const external = await fetchExternalQuota(providerId, trigger === "checkaq" || trigger === "agent_settled", controller.signal);
       payload = external.payload;
       identityKey = external.identityKey;
       accountLabel = external.accountLabel;
-      providerIdentityKeys.set(providerId, identityKey);
+      // Cache hits must retain the source timestamp, not pretend to be fresh.
+      fetchedAt = external.fetchedAt ?? Date.now();
     } else {
       payload = await fetchWithRetry(controller.signal, () =>
         fetchProviderQuota(providerId, fetchAuth!, controller.signal),
       );
     }
+    if (inflightRequest !== request || controller.signal.aborted || currentProvider !== providerId) return result;
     if (payload === null) {
       currentStatus = "un-provider";
       result = { ok: false };
@@ -643,9 +666,15 @@ async function refreshQuota(ctx: ExtensionContext, trigger: RefreshTrigger): Pro
     validatePayload(payload);
 
     if (inflightRequest === request && currentProvider === providerId) {
+      if (identityKey) providerIdentityKeys.set(providerId, identityKey);
+      const latest = latestCachedSnapshot(providerId);
+      if (latest && latest.fetchedAt > fetchedAt) {
+        currentStatus = "ok";
+        return result = { ok: true, snapshot: latest };
+      }
       const snapshot: QuotaSnapshot = {
         provider: providerId,
-        fetchedAt: Date.now(),
+        fetchedAt: isExternalQuotaProvider(providerId) ? fetchedAt : Date.now(),
         identityKey,
         accountLabel,
         ...payload,
@@ -1088,13 +1117,37 @@ export default function (pi: ExtensionAPI) {
     if (event.provider !== "codex-account-pool" || event.sessionId !== currentSessionId || typeof event.accountId !== "string") return;
     providerIdentityKeys.set("codex-account-pool", event.accountId);
     if (currentProvider !== "codex-account-pool" || !lastCtx) return;
-    inflightRequest?.controller.abort();
+    const previous = inflightRequest;
+    inflightRequest = null; // A cancelled request must not deduplicate the new account's fetch.
+    previous?.controller.abort();
     baseRound = null;
     roundProviderChanged = true;
     lastDiff = { kind: "changed" };
     currentStatus = "fetching";
     refreshWidget(lastCtx);
     void refreshQuota(lastCtx, "model_select");
+  });
+
+  const stopQuotaUpdates = pi.events.on(QUOTA_UPDATED_EVENT, (raw) => {
+    const event = raw as ExternalQuotaResponse;
+    if (isShuttingDown || !lastCtx || currentProvider !== POOL_PROVIDER || event?.provider !== POOL_PROVIDER) return;
+    // Late updates for the previous account must never overwrite the active one.
+    if (typeof event.identityKey !== "string" || providerIdentityKeys.get(POOL_PROVIDER) !== event.identityKey) return;
+    if (typeof event.fetchedAt !== "number" || !Number.isFinite(event.fetchedAt)) return;
+    try { validatePayload(event.payload); } catch { return; }
+    const latest = latestCachedSnapshot(POOL_PROVIDER);
+    if (latest && latest.fetchedAt >= event.fetchedAt) return;
+    const snapshot: QuotaSnapshot = {
+      ...(event.payload as FetchPayload),
+      provider: POOL_PROVIDER,
+      identityKey: event.identityKey,
+      accountLabel: typeof event.accountLabel === "string" ? event.accountLabel : undefined,
+      fetchedAt: event.fetchedAt,
+    };
+    updateSuccessfulLine(POOL_PROVIDER, snapshot, "pool_update");
+    currentStatus = "ok";
+    writeDiskCacheAsync();
+    refreshWidget(lastCtx);
   });
 
   pi.on("session_shutdown", async () => {
@@ -1105,11 +1158,13 @@ export default function (pi: ExtensionAPI) {
     inflightRequest = null;
     request?.controller.abort();
     stopAccountChanged();
+    stopQuotaUpdates();
     currentSessionId = null;
 
     await diskWriteQueue;
   });
   pi.on("session_start", (event, ctx) => {
+    isShuttingDown = false;
     currentSessionId = ctx.sessionManager.getSessionId();
     handleSessionStart(ctx, event.reason);
     ensureAgeTicker();
@@ -1119,6 +1174,9 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on("agent_start", async (_event, ctx) => {
     await handleAgentStart(ctx);
+  });
+  pi.on("turn_end", (_event, ctx) => {
+    if (normalizeProvider(ctx.model?.provider) === POOL_PROVIDER) void refreshQuota(ctx, "turn_end");
   });
   pi.on("agent_settled", async (_event, ctx) => {
     await handleAgentSettled(ctx);

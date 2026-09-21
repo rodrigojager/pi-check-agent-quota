@@ -31,6 +31,8 @@ pi install https://github.com/rodrigojager/pi-check-agent-quota
 
 此分支通过 Pi 共享事件总线支持 `rodrigojager/pi-codex-account-pool`，并保留所有原有 provider。
 
+**Codex Pool 实时刷新：** 更新两个分支后运行 `/reload`。选中 `codex-account-pool` 时，执行期间约每 15 秒、空闲时约每 60 秒查询；即使 `/aqauto off` 也生效。每个工具轮次结束也会查询，任务结束和 `/checkaq` 强制刷新。Pool 的新快照通过事件总线立即更新界面，不传递凭据；缓存保留原始时间戳，切换账号后忽略旧响应。网络错误仍可能导致数据过期，执行期间也会显示失败状态。`Usage` 表示已使用比例，100% 即剩余 0%。以下 `/aqauto` 默认关闭的说明仅适用于其他 provider。详见 [English documentation](README_EN.md#live-codex-pool-usage)。
+
 API key 复用 pi 已有的 provider 认证，无需额外配置。
 
 ## 认证命令（pi 内置）

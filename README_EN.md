@@ -31,6 +31,14 @@ pi install https://github.com/rodrigojager/pi-check-agent-quota
 
 This fork adds account-aware integration with `rodrigojager/pi-codex-account-pool`; all original provider fetchers remain available.
 
+### Live Codex Pool usage
+
+Update both forks and run `/reload`. While `codex-account-pool` is selected, quota is polled approximately every **15 seconds while busy** (including streaming/tool execution) and **60 seconds idle**, even with `/aqauto off`. Each `turn_end` also requests quota; settlement and `/checkaq` request a forced refresh. The pool coalesces concurrent requests and caches endpoint readings for 15 seconds.
+
+New pool readings are pushed through `pi-quota:updated` immediately, including manual pool refreshes and 429 refreshes. Only sanitized identity/label/quota/timestamps cross the bus. Cache hits preserve the original `fetchedAt`; old responses cannot overwrite a new account or newer reading. Refresh failures are shown even while busy. Network failures and upstream reporting delays can still prevent a live reading.
+
+`Usage` is **used percentage**, not remaining percentage (100% used = 0% remaining).
+
 API keys reuse pi's existing provider authentication, no extra configuration required.
 
 ## Authentication commands (built into pi)
@@ -72,7 +80,7 @@ Shown on the right side of the status bar as `2m ago · Available: N rounds/2h15
   - ≤5 rounds or ≤30 minutes remaining → number highlighted in red
 - **Layout**: auto-wraps on narrow windows, recalculates on resize; time precise to minutes (`2h15m`), converted to days at ≥24h (`3d4h`).
 - **Last refresh**: `2m ago ·` (zh: `2分前 ·`) before the ETA label when ETA is available; without ETA it is shown as `2m ago` (zh: `2分前`) = the displayed quota snapshot was fetched 2 minutes ago. Definition: `age = now − latest successful fetch of this provider` (fetches are triggered by session start, model switch, round settlement, `/checkaq`; on session resume it may come from the disk cache and honestly show e.g. `5h ago`). Recomputed every minute even when idle; age remains independent when ETA is unavailable (including exhausted/narrow windows or insufficient samples), and shows the latest successful snapshot age even after a fetch failure.
-- **Auto refresh (opt-in)**: off by default. Enable via `/aqauto 5` (every 5 minutes), `/aqauto on` (default 5), disable via `/aqauto off`, view via `/aqauto`. With it on, idle pi fetches the quota on that interval (pure monitoring; no conversation needed). Manual `/checkaq` and round settlement still work as usual and postpone the next auto fetch. The setting is persisted like thresholds; the env var `PI_QUOTA_AUTO_REFRESH_MINUTES` works as an initial value.
+- **Auto refresh (opt-in, other providers)**: off by default; Codex Pool uses the live schedule above independently. Enable via `/aqauto 5` (every 5 minutes), `/aqauto on` (default 5), disable via `/aqauto off`, view via `/aqauto`. With it on, idle pi fetches the quota on that interval (pure monitoring; no conversation needed). Manual `/checkaq` and round settlement still work as usual and postpone the next auto fetch. The setting is persisted like thresholds; the env var `PI_QUOTA_AUTO_REFRESH_MINUTES` works as an initial value.
 
 ## Commands
 
@@ -158,7 +166,7 @@ Rules:
 
 ### `/aqauto` — idle auto refresh
 
-Off by default; when enabled, the quota is refetched on the given interval even with no conversation:
+For providers other than Codex Pool, off by default; when enabled, the quota is refetched on the given interval even with no conversation. Codex Pool always uses its live 15s/60s schedule; `/aqauto` controls the setting for other providers:
 
 ```text
 /aqauto               # view current status (e.g. Auto refresh: every 5 minutes)
@@ -205,7 +213,8 @@ After confirming the new location is readable/writable, the old file can be remo
 - No prompt, reply, file or conversation content is read or uploaded; no API key or full response is stored; no telemetry;
 - Local cache is at `~/.pi/agent/pi-check-agent-quota/quota-cache.json`, readable/writable only by current user;
 - Custom `baseUrl` allows only HTTPS (HTTP allowed for loopback), requests do not follow redirects;
-- By default the extension only fetches on user-visible events (session start, model switch, round settlement, `/checkaq`). If you enable auto refresh via `/aqauto`, idle background fetches are sent on that interval while pi is open.
+- Codex Pool uses background monitoring every ~15s busy / ~60s idle while selected. Other providers only fetch on user-visible events by default (session start, model switch, round settlement, `/checkaq`); `/aqauto` enables their background polling.
+- `PI_AGENT_DIR` is respected when locating the quota cache; credentials are never stored there.
 
 ## License
 

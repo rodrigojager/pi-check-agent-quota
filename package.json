@@ -1,6 +1,6 @@
 {
   "name": "pi-check-agent-quota",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Show AI provider quota and balance in the pi TUI status widget",
   "keywords": [
     "pi",
@@ -44,7 +44,8 @@
   },
   "main": "extensions/index.ts",
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "npm run typecheck && node --test tests/*.test.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.19.19",
